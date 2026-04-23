@@ -19,6 +19,7 @@ LOG_FILE = BASE_DIR / "aqua-4h-github-runner.log"
 STATE_FILE = BASE_DIR / "aqua-4h-agent-state.json"
 
 INITIAL_BALANCE = float(os.environ.get("AQUA_INITIAL_BALANCE", "100000"))
+HIGHEST_BALANCE_HINT = float(os.environ.get("AQUA_HIGHEST_BALANCE", "103000") or "103000")
 TRAILING_RATE = 0.05
 DAILY_DD = 0.03 * INITIAL_BALANCE
 VALID_DAY_PROFIT = 0.005 * INITIAL_BALANCE
@@ -35,7 +36,7 @@ def log(message: str):
 
 def telegram(text: str):
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
-    chat_id = os.enviromanaged_openn.get("TELEGRAM_CHAT_ID")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
     if not token or not chat_id:
         return
     data = urllib.parse.urlencode({"chat_id": chat_id, "text": text}).encode("utf-8")
@@ -101,7 +102,7 @@ def ensure_state(state: dict, snap: dict, now: pd.Timestamp) -> dict:
             "initial_balance": INITIAL_BALANCE,
             "cycle_start_balance": snap["balance"],
             "cycle_start_time": now.isoformat(),
-            "highest_balance": max(INITIAL_BALANCE, snap["balance"]),
+            "highest_balance": max(INITIAL_BALANCE, snap["balance"], HIGHEST_BALANCE_HINT),
             "daily_anchor_day": day_key(now),
             "daily_anchor_balance": snap["balance"],
             "daily_realized": {},
@@ -112,7 +113,11 @@ def ensure_state(state: dict, snap: dict, now: pd.Timestamp) -> dict:
             "managed_target_local": None,
         }
 
-    state["highest_balance"] = max(float(state.get("highest_balance", INITIAL_BALANCE)), snap["balance"])
+    state["highest_balance"] = max(
+        float(state.get("highest_balance", INITIAL_BALANCE)),
+        snap["balance"],
+        HIGHEST_BALANCE_HINT,
+    )
     state.setdefault("managed_open", False)
     state.setdefault("managed_ticket", None)
     state.setdefault("managed_target_local", None)
@@ -221,6 +226,7 @@ def choose_lot_size(metrics: dict, state: dict) -> tuple[float, str]:
     if current_day_profit >= daily_profit_cap:
         return 0.0, "Consistency guard: daily profit cap reached, stop for the day."
 
+    # Start smaller to protect drawdown and keep single-day profits payout-friendly.
     lot = 0.4
     reason = "Base size 0.4"
 
