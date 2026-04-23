@@ -35,7 +35,7 @@ def log(message: str):
 
 def telegram(text: str):
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
-    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+    chat_id = os.enviromanaged_openn.get("TELEGRAM_CHAT_ID")
     if not token or not chat_id:
         return
     data = urllib.parse.urlencode({"chat_id": chat_id, "text": text}).encode("utf-8")
@@ -107,9 +107,15 @@ def ensure_state(state: dict, snap: dict, now: pd.Timestamp) -> dict:
             "daily_realized": {},
             "closed_trades": [],
             "first_trade_time": None,
+            "managed_open": False,
+            "managed_ticket": None,
+            "managed_target_local": None,
         }
 
     state["highest_balance"] = max(float(state.get("highest_balance", INITIAL_BALANCE)), snap["balance"])
+    state.setdefault("managed_open", False)
+    state.setdefault("managed_ticket", None)
+    state.setdefault("managed_target_local", None)
 
     today = day_key(now)
     if state.get("daily_anchor_day") != today:
@@ -215,7 +221,6 @@ def choose_lot_size(metrics: dict, state: dict) -> tuple[float, str]:
     if current_day_profit >= daily_profit_cap:
         return 0.0, "Consistency guard: daily profit cap reached, stop for the day."
 
-    # Start smaller to protect drawdown and keep single-day profits payout-friendly.
     lot = 0.4
     reason = "Base size 0.4"
 
@@ -301,6 +306,37 @@ def close_all_positions(page):
     return closed
 
 
+def detect_latest_ticket(page) -> str | None:
+    tickets = page.get_by_text(re.compile(r"\b\d{8}\b"))
+    if tickets.count() == 0:
+        return None
+    return tickets.last.inner_text().strip()
+
+
+def close_managed_position(page, managed_ticket: str):
+    if not managed_ticket:
+        return []
+    if no_positions_visible(page):
+        return []
+
+    ticket_matches = page.get_by_text(re.compile(rf"\b{re.escape(str(managed_ticket))}\b"))
+    if ticket_matches.count() == 0:
+        raise RuntimeError(
+            f"Managed ticket {managed_ticket} not found in open positions. "
+            "Refusing to close any unrelated position."
+        )
+
+    ticket_matches.last.dblclick()
+    close_btn = page.get_by_role("button", name=re.compile(r"^Close #"))
+    close_btn.wait_for(timeout=10000)
+    close_text = close_btn.inner_text()
+    close_btn.click()
+    page.get_by_role("button", name="OK").wait_for(timeout=10000)
+    page.get_by_role("button", name="OK").click()
+    page.wait_for_timeout(2000)
+    return [close_text]
+
+
 def open_order_ticket(page):
     create_btn = page.get_by_role("button", name="Create New Order")
     if create_btn.count() > 0 and create_btn.first.is_visible():
@@ -350,13 +386,40 @@ def run():
         snap_before = account_snapshot(page)
         state = ensure_state(state, snap_before, now)
 
-        closed = close_all_positions(page)
-        page.wait_for_timeout(1500)
-        snap_after_close = account_snapshot(page)
-        realized_pnl = round(snap_after_close["balance"] - snap_before["balance"], 2)
-        if closed:
-            record_realized_pnl(state, now, realized_pnl, "; ".join(closed))
-            log(f"Closed prior position(s) | realized_pnl={realized_pnl:+.2f} | {closed}")
+        closed = []
+        snap_after_close = snap_before
+        if state.get("managed_open"):
+            managed_ticket = str(state.get("managed_ticket") or "").strip()
+            if not managed_ticket:
+                raise RuntimeError(
+                    "State says a bot-managed position is open, but no managed_ticket is recorded."
+                )
+            closed = close_managed_position(page, managed_ticket)
+            page.wait_for_timeout(1500)
+            snap_after_close = account_snapshot(page)
+            realized_pnl = round(snap_after_close["balance"] - snap_before["balance"], 2)
+            if closed:
+                record_realized_pnl(state, now, realized_pnl, "; ".join(closed))
+                state["managed_open"] = False
+                state["managed_ticket"] = None
+                state["managed_target_local"] = None
+                log(
+                    f"Closed bot-managed prior position | ticket={managed_ticket} "
+                    f"| realized_pnl={realized_pnl:+.2f} | {closed}"
+                )
+        elif not no_positions_visible(page):
+            save_state(state)
+            browser.close()
+            message = (
+                "Aqua 4H: standing down\n"
+                "Detected an existing open position that is not bot-managed.\n"
+                "The cloud bot will not close or stack on top of your manual trade."
+            )
+            telegram(message)
+            log("Existing non-bot position detected; standing down without action.")
+            return
+        else:
+            log("Account flat and no bot-managed prior position recorded; safe to proceed.")
 
         state = ensure_state(state, snap_after_close, now)
         metrics = payout_metrics(state, snap_after_close, now)
@@ -389,6 +452,12 @@ def run():
 
         place_signal_order(page, sig, lot_size)
         page.wait_for_timeout(1500)
+        new_ticket = detect_latest_ticket(page)
+        if not new_ticket:
+            raise RuntimeError("Placed a trade but could not detect the new open ticket.")
+        state["managed_open"] = True
+        state["managed_ticket"] = new_ticket
+        state["managed_target_local"] = sig["target_local"]
         snap_after_open = account_snapshot(page)
         state = ensure_state(state, snap_after_open, now)
         save_state(state)
