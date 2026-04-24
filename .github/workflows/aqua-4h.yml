@@ -3,10 +3,12 @@ name: aqua-4h-btcusd
 on:
   workflow_dispatch:
   schedule:
-    # Pre-warm 4 minutes before Nigeria/WAT 4H candle opens.
+    # Pre-warm 35 minutes before Nigeria/WAT 4H candle opens.
+    # GitHub-hosted runners are not real-time; starting early gives the job
+    # enough room to install/load, then the Python runner waits for candle open.
     # WAT candle opens: 01:00, 05:00, 09:00, 13:00, 17:00, 21:00.
-    # UTC cron starts: 23:56, 03:56, 07:56, 11:56, 15:56, 19:56.
-    - cron: "56 23,3,7,11,15,19 * * *"
+    # UTC cron starts: 23:25, 03:25, 07:25, 11:25, 15:25, 19:25.
+    - cron: "25 23,3,7,11,15,19 * * *"
 
 permissions:
   contents: write
@@ -14,7 +16,7 @@ permissions:
 jobs:
   trade:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 70
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -41,7 +43,7 @@ jobs:
           AQUA_INITIAL_BALANCE: "100000"
           AQUA_PAYOUT_DAYS: "14"
           AQUA_PREWARM: "1"
-          AQUA_PREWARM_MAX_MINUTES: "15"
+          AQUA_PREWARM_MAX_MINUTES: "75"
           AQUA_CLOSE_LEAD_SECONDS: "20"
           AQUA_OPEN_DELAY_SECONDS: "5"
         run: python aqua_4h_github_runner.py
