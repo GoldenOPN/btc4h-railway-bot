@@ -268,7 +268,21 @@ def today_trade_stats(state: dict, now: pd.Timestamp) -> dict:
 
     wins = sum(1 for trade in trades if float(trade["pnl"]) > 0.0)
     losses = sum(1 for trade in trades if float(trade["pnl"]) < 0.0)
-    return {"trades": len(trades), "wins": wins, "losses": losses}
+    consecutive_losses = 0
+    for trade in reversed(trades):
+        if float(trade["pnl"]) < 0.0:
+            consecutive_losses += 1
+        else:
+            break
+
+    last_pnl = float(trades[-1]["pnl"]) if trades else 0.0
+    return {
+        "trades": len(trades),
+        "wins": wins,
+        "losses": losses,
+        "consecutive_losses": consecutive_losses,
+        "last_pnl": last_pnl,
+    }
 
 
 def choose_lot_size(metrics: dict, state: dict) -> tuple[float, str]:
@@ -299,15 +313,17 @@ def choose_lot_size(metrics: dict, state: dict) -> tuple[float, str]:
     if current_day_profit >= daily_profit_cap:
         return 0.0, "Consistency guard: daily profit cap reached, stop for the day."
 
-    if day_stats["losses"] >= 2 or current_day_profit <= -800:
-        return 0.0, "Daily loss throttle: stop after two losses or about -800 closed PnL."
+    if day_stats["consecutive_losses"] >= 2 or current_day_profit <= -1000:
+        return 0.0, "Daily recovery stop: stop after two consecutive losses or about -1000 closed PnL."
 
     # Start smaller to protect drawdown and keep single-day profits payout-friendly.
     lot = 0.4
     reason = "Base size 0.4"
 
     loss_throttle_cap = None
-    if day_stats["losses"] >= 1 or current_day_profit <= -400:
+    if day_stats["consecutive_losses"] == 1:
+        loss_throttle_cap = 0.3
+    if current_day_profit <= -700:
         loss_throttle_cap = 0.2
 
     if (
@@ -345,7 +361,10 @@ def choose_lot_size(metrics: dict, state: dict) -> tuple[float, str]:
 
     if loss_throttle_cap is not None and lot > loss_throttle_cap:
         lot = loss_throttle_cap
-        reason = "Reduced to 0.2 after a closed daily loss."
+        if day_stats["consecutive_losses"] == 1 and current_day_profit > -700:
+            reason = "Reduced to 0.3 for one recovery trade after the latest closed loss."
+        else:
+            reason = "Reduced to 0.2 after deeper intraday drawdown."
 
     return lot, reason
 
