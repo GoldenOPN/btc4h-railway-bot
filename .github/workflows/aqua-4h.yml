@@ -3,7 +3,10 @@ name: aqua-4h-btcusd
 on:
   workflow_dispatch:
   schedule:
-    - cron: "5 0,4,8,12,16,20 * * *"
+    # Pre-warm 4 minutes before Nigeria/WAT 4H candle opens.
+    # WAT candle opens: 01:00, 05:00, 09:00, 13:00, 17:00, 21:00.
+    # UTC cron starts: 23:56, 03:56, 07:56, 11:56, 15:56, 19:56.
+    - cron: "56 23,3,7,11,15,19 * * *"
 
 permissions:
   contents: write
@@ -37,6 +40,10 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           AQUA_INITIAL_BALANCE: "100000"
           AQUA_PAYOUT_DAYS: "14"
+          AQUA_PREWARM: "1"
+          AQUA_PREWARM_MAX_MINUTES: "15"
+          AQUA_CLOSE_LEAD_SECONDS: "20"
+          AQUA_OPEN_DELAY_SECONDS: "5"
         run: python aqua_4h_github_runner.py
 
       - name: Persist agent state
