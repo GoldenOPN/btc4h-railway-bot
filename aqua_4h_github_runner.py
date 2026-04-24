@@ -367,27 +367,89 @@ def open_order_ticket(page):
     page.wait_for_timeout(1500)
 
 
-def fill_order(page, sig: dict, volume: float):
+def order_ticket_inputs(page) -> list[dict]:
     inputs = page.locator("input:visible")
-    if inputs.count() < 3:
+    meta = inputs.evaluate_all(
+        """
+        els => els.map((el, index) => {
+            const r = el.getBoundingClientRect();
+            return {
+                index,
+                x: r.x,
+                y: r.y,
+                width: r.width,
+                height: r.height,
+                value: el.value || "",
+                placeholder: el.getAttribute("placeholder") || "",
+                aria: el.getAttribute("aria-label") || "",
+                name: el.getAttribute("name") || ""
+            };
+        }).filter(item => item.x < 360 && item.width > 20 && item.height > 10)
+          .sort((a, b) => (a.y - b.y) || (a.x - b.x));
+        """
+    )
+    return meta
+
+
+def fill_visible_input(page, visible_index: int, value: str):
+    field = page.locator("input:visible").nth(visible_index)
+    field.click()
+    field.fill(value)
+    page.wait_for_timeout(250)
+
+
+def fill_order(page, sig: dict, volume: float):
+    ticket_inputs = order_ticket_inputs(page)
+    if len(ticket_inputs) < 3:
+        all_inputs = page.locator("input:visible").evaluate_all(
+            """
+            els => els.map((el, index) => {
+                const r = el.getBoundingClientRect();
+                return {index, x: r.x, y: r.y, width: r.width, height: r.height, value: el.value || "", placeholder: el.getAttribute("placeholder") || ""};
+            });
+            """
+        )
+        log("Visible input map: " + json.dumps(all_inputs))
         raise RuntimeError("Could not locate enough visible input fields in the order ticket.")
 
-    inputs.nth(0).fill(f"{volume:.2f}")
-    inputs.nth(1).fill(f"{sig['sl']:.2f}")
-    inputs.nth(2).fill(f"{sig['tp']:.2f}")
+    fill_visible_input(page, int(ticket_inputs[0]["index"]), f"{volume:.2f}")
+    fill_visible_input(page, int(ticket_inputs[1]["index"]), f"{sig['sl']:.2f}")
+    fill_visible_input(page, int(ticket_inputs[2]["index"]), f"{sig['tp']:.2f}")
 
-    if inputs.count() >= 4:
+    if len(ticket_inputs) >= 4:
         try:
-            inputs.nth(3).fill(f"4h {sig['target_local']} {sig['bias']}")
+            fill_visible_input(
+                page,
+                int(ticket_inputs[3]["index"]),
+                f"4h {sig['target_local']} {sig['bias']}",
+            )
         except Exception:
             pass
+
+    log(
+        "Order ticket filled | "
+        f"bias={sig['bias']} | volume={volume:.2f} | "
+        f"sl={sig['sl']:.2f} | tp={sig['tp']:.2f} | "
+        f"fields={json.dumps(ticket_inputs[:4])}"
+    )
 
 
 def place_signal_order(page, sig: dict, volume: float):
     open_order_ticket(page)
     fill_order(page, sig, volume)
     button_name = "Buy by Market" if sig["bias"] == "Buy" else "Sell by Market"
-    page.get_by_role("button", name=button_name).click()
+    button = page.get_by_role("button", name=button_name)
+    for _ in range(15):
+        if button.is_enabled():
+            break
+        page.wait_for_timeout(1000)
+
+    if not button.is_enabled():
+        log("Order button still disabled | inputs=" + json.dumps(order_ticket_inputs(page)))
+        page.screenshot(path=str(BASE_DIR / "aqua-order-disabled.png"), full_page=True)
+        raise RuntimeError(f"{button_name} remained disabled after filling the order ticket.")
+
+    button.click()
     page.get_by_role("button", name="OK").wait_for(timeout=10000)
     page.get_by_role("button", name="OK").click()
     page.wait_for_timeout(2000)
