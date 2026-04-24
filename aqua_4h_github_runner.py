@@ -113,14 +113,26 @@ def ensure_state(state: dict, snap: dict, now: pd.Timestamp) -> dict:
             "managed_target_local": None,
         }
 
+    # Older committed state files may be partial. Backfill safely instead of
+    # crashing before a signal can be placed.
+    state.setdefault("initial_balance", INITIAL_BALANCE)
+    state.setdefault("cycle_start_balance", snap["balance"])
+    state.setdefault("cycle_start_time", now.isoformat())
+    state.setdefault("highest_balance", max(INITIAL_BALANCE, snap["balance"], HIGHEST_BALANCE_HINT))
+    state.setdefault("daily_anchor_day", day_key(now))
+    state.setdefault("daily_anchor_balance", snap["balance"])
+    state.setdefault("daily_realized", {})
+    state.setdefault("closed_trades", [])
+    state.setdefault("first_trade_time", None)
+    state.setdefault("managed_open", False)
+    state.setdefault("managed_ticket", None)
+    state.setdefault("managed_target_local", None)
+
     state["highest_balance"] = max(
         float(state.get("highest_balance", INITIAL_BALANCE)),
         snap["balance"],
         HIGHEST_BALANCE_HINT,
     )
-    state.setdefault("managed_open", False)
-    state.setdefault("managed_ticket", None)
-    state.setdefault("managed_target_local", None)
 
     today = day_key(now)
     if state.get("daily_anchor_day") != today:
@@ -147,7 +159,8 @@ def payout_metrics(state: dict, snap: dict, now: pd.Timestamp) -> dict:
     daily_realized = state.get("daily_realized", {})
     positive_days = [float(v) for v in daily_realized.values() if float(v) > 0.0]
     biggest_day_profit = max(positive_days) if positive_days else 0.0
-    cycle_profit = float(snap["balance"] - float(state["cycle_start_balance"]))
+    cycle_start_balance = float(state.get("cycle_start_balance", snap["balance"]))
+    cycle_profit = float(snap["balance"] - cycle_start_balance)
     required_profit_for_consistency = (
         (biggest_day_profit / CONSISTENCY_LIMIT) + 0.01 if biggest_day_profit > 0.0 else 0.0
     )
@@ -158,11 +171,11 @@ def payout_metrics(state: dict, snap: dict, now: pd.Timestamp) -> dict:
     if first_trade_time is not None:
         payout_wait_met = (now - first_trade_time).days >= DEFAULT_PAYOUT_DAYS
 
-    highest_balance = float(state["highest_balance"])
+    highest_balance = float(state.get("highest_balance", max(INITIAL_BALANCE, snap["balance"], HIGHEST_BALANCE_HINT)))
     trailing_floor = highest_balance * (1.0 - TRAILING_RATE)
     trailing_cushion = float(snap["equity"] - trailing_floor)
 
-    daily_anchor = float(state["daily_anchor_balance"])
+    daily_anchor = float(state.get("daily_anchor_balance", snap["balance"]))
     daily_floor = daily_anchor - DAILY_DD
     daily_cushion = float(snap["equity"] - daily_floor)
     current_day_profit = float(daily_realized.get(day_key(now), 0.0))
