@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import time
 import traceback
 import urllib.parse
 import urllib.request
@@ -25,6 +26,11 @@ DAILY_DD = 0.03 * INITIAL_BALANCE
 VALID_DAY_PROFIT = 0.005 * INITIAL_BALANCE
 CONSISTENCY_LIMIT = 0.15
 DEFAULT_PAYOUT_DAYS = int(os.environ.get("AQUA_PAYOUT_DAYS", "14"))
+LOCAL_TIMEZONE = "Africa/Lagos"
+PREWARM_ENABLED = os.environ.get("AQUA_PREWARM", "0") == "1"
+PREWARM_MAX_MINUTES = float(os.environ.get("AQUA_PREWARM_MAX_MINUTES", "12"))
+CLOSE_LEAD_SECONDS = float(os.environ.get("AQUA_CLOSE_LEAD_SECONDS", "20"))
+OPEN_DELAY_SECONDS = float(os.environ.get("AQUA_OPEN_DELAY_SECONDS", "5"))
 
 
 def log(message: str):
@@ -49,15 +55,42 @@ def telegram(text: str):
         pass
 
 
-def current_target_local() -> pd.Timestamp:
+def planned_target(now: pd.Timestamp) -> tuple[pd.Timestamp, pd.Timestamp, bool]:
     override = os.environ.get("TARGET_DATETIME")
     if override:
-        return pd.to_datetime(override)
-    return signal_core.current_target_local()
+        target_local = pd.to_datetime(override)
+        if target_local.tzinfo is None:
+            target_local = target_local.tz_localize(LOCAL_TIMEZONE)
+        else:
+            target_local = target_local.tz_convert(LOCAL_TIMEZONE)
+        target_utc = target_local.tz_convert("UTC")
+        return target_utc, target_local.tz_localize(None), False
+
+    floor_utc = now.floor("4h")
+    target_utc = floor_utc
+    prewarm = False
+
+    if PREWARM_ENABLED:
+        next_utc = floor_utc + pd.Timedelta(hours=4)
+        seconds_to_next = (next_utc - now).total_seconds()
+        if 0.0 < seconds_to_next <= PREWARM_MAX_MINUTES * 60.0:
+            target_utc = next_utc
+            prewarm = True
+
+    target_local = target_utc.tz_convert(LOCAL_TIMEZONE).tz_localize(None)
+    return target_utc, target_local, prewarm
 
 
 def now_utc() -> pd.Timestamp:
     return pd.Timestamp.now(tz="UTC")
+
+
+def wait_until_utc(target: pd.Timestamp, label: str):
+    remaining = (target - now_utc()).total_seconds()
+    if remaining <= 0:
+        return
+    log(f"Waiting {remaining:.1f}s until {label}: {target.isoformat()}")
+    time.sleep(remaining)
 
 
 def day_key(ts: pd.Timestamp) -> str:
@@ -127,6 +160,7 @@ def ensure_state(state: dict, snap: dict, now: pd.Timestamp) -> dict:
     state.setdefault("managed_open", False)
     state.setdefault("managed_ticket", None)
     state.setdefault("managed_target_local", None)
+    state.setdefault("last_balance", state.get("cycle_start_balance", snap["balance"]))
 
     state["highest_balance"] = max(
         float(state.get("highest_balance", INITIAL_BALANCE)),
@@ -153,6 +187,15 @@ def record_realized_pnl(state: dict, now: pd.Timestamp, pnl: float, note: str):
     trades = state.setdefault("closed_trades", [])
     trades.append({"ts": now.isoformat(), "pnl": round(float(pnl), 2), "note": note})
     state["closed_trades"] = trades[-200:]
+
+
+def record_balance_delta(state: dict, snap: dict, now: pd.Timestamp, note: str) -> float:
+    previous_balance = float(state.get("last_balance", snap["balance"]))
+    pnl = round(float(snap["balance"] - previous_balance), 2)
+    if abs(pnl) >= 0.01:
+        record_realized_pnl(state, now, pnl, note)
+    state["last_balance"] = snap["balance"]
+    return pnl
 
 
 def payout_metrics(state: dict, snap: dict, now: pd.Timestamp) -> dict:
@@ -212,6 +255,22 @@ def recent_win_rate(state: dict, limit: int = 12) -> float:
     return wins / len(recent)
 
 
+def today_trade_stats(state: dict, now: pd.Timestamp) -> dict:
+    today = day_key(now)
+    trades = []
+    for trade in state.get("closed_trades", []):
+        try:
+            trade_day = pd.to_datetime(trade["ts"], utc=True).strftime("%Y-%m-%d")
+        except Exception:
+            continue
+        if trade_day == today and abs(float(trade.get("pnl", 0.0))) > 1e-9:
+            trades.append(trade)
+
+    wins = sum(1 for trade in trades if float(trade["pnl"]) > 0.0)
+    losses = sum(1 for trade in trades if float(trade["pnl"]) < 0.0)
+    return {"trades": len(trades), "wins": wins, "losses": losses}
+
+
 def choose_lot_size(metrics: dict, state: dict) -> tuple[float, str]:
     if metrics["payout_ready"]:
         return 0.0, "Payout conditions met. Stay flat until you request the withdrawal."
@@ -229,6 +288,7 @@ def choose_lot_size(metrics: dict, state: dict) -> tuple[float, str]:
     current_day_profit = metrics["current_day_profit"]
     recent_wr = recent_win_rate(state)
     consistency_gap = metrics["cycle_profit"] - metrics["required_profit_for_consistency"]
+    day_stats = today_trade_stats(state, now_utc())
 
     daily_profit_cap = 600.0
     if cycle_profit >= 4000:
@@ -239,9 +299,16 @@ def choose_lot_size(metrics: dict, state: dict) -> tuple[float, str]:
     if current_day_profit >= daily_profit_cap:
         return 0.0, "Consistency guard: daily profit cap reached, stop for the day."
 
+    if day_stats["losses"] >= 2 or current_day_profit <= -800:
+        return 0.0, "Daily loss throttle: stop after two losses or about -800 closed PnL."
+
     # Start smaller to protect drawdown and keep single-day profits payout-friendly.
     lot = 0.4
     reason = "Base size 0.4"
+
+    loss_throttle_cap = None
+    if day_stats["losses"] >= 1 or current_day_profit <= -400:
+        loss_throttle_cap = 0.2
 
     if (
         cycle_profit >= 2500
@@ -275,6 +342,10 @@ def choose_lot_size(metrics: dict, state: dict) -> tuple[float, str]:
     ):
         lot = 1.0
         reason = "Raised to 1.0 only after payout-friendly buffer is strong"
+
+    if loss_throttle_cap is not None and lot > loss_throttle_cap:
+        lot = loss_throttle_cap
+        reason = "Reduced to 0.2 after a closed daily loss."
 
     return lot, reason
 
@@ -477,6 +548,19 @@ def place_signal_order(page, sig: dict, volume: float):
 
 def run():
     now = now_utc()
+    target_utc, target_local, prewarm = planned_target(now)
+    close_at = target_utc - pd.Timedelta(seconds=CLOSE_LEAD_SECONDS) if prewarm else now
+    open_at = target_utc + pd.Timedelta(seconds=OPEN_DELAY_SECONDS) if prewarm else now
+
+    log(
+        "Timing plan | "
+        f"prewarm={'yes' if prewarm else 'no'} | "
+        f"target_utc={target_utc.isoformat()} | "
+        f"target_local={target_local} | "
+        f"close_at={close_at.isoformat()} | "
+        f"open_at={open_at.isoformat()}"
+    )
+
     state = load_state()
 
     with sync_playwright() as pw:
@@ -495,19 +579,40 @@ def run():
                 raise RuntimeError(
                     "State says a bot-managed position is open, but no managed_ticket is recorded."
                 )
-            closed = close_managed_position(page, managed_ticket)
-            page.wait_for_timeout(1500)
-            snap_after_close = account_snapshot(page)
-            realized_pnl = round(snap_after_close["balance"] - snap_before["balance"], 2)
-            if closed:
-                record_realized_pnl(state, now, realized_pnl, "; ".join(closed))
+
+            if no_positions_visible(page):
+                realized_pnl = record_balance_delta(
+                    state,
+                    snap_before,
+                    now_utc(),
+                    f"Managed ticket {managed_ticket} was already closed by TP/SL before this run.",
+                )
                 state["managed_open"] = False
                 state["managed_ticket"] = None
                 state["managed_target_local"] = None
                 log(
-                    f"Closed bot-managed prior position | ticket={managed_ticket} "
-                    f"| realized_pnl={realized_pnl:+.2f} | {closed}"
+                    f"Managed prior position already closed | ticket={managed_ticket} "
+                    f"| realized_pnl={realized_pnl:+.2f}"
                 )
+            else:
+                wait_until_utc(close_at, "managed position close window")
+                closed = close_managed_position(page, managed_ticket)
+                page.wait_for_timeout(1500)
+                snap_after_close = account_snapshot(page)
+                realized_pnl = record_balance_delta(
+                    state,
+                    snap_after_close,
+                    now_utc(),
+                    "; ".join(closed) if closed else f"Managed ticket {managed_ticket} close check",
+                )
+                if closed:
+                    state["managed_open"] = False
+                    state["managed_ticket"] = None
+                    state["managed_target_local"] = None
+                    log(
+                        f"Closed bot-managed prior position | ticket={managed_ticket} "
+                        f"| realized_pnl={realized_pnl:+.2f} | {closed}"
+                    )
         elif not no_positions_visible(page):
             save_state(state)
             browser.close()
@@ -520,10 +625,11 @@ def run():
             log("Existing non-bot position detected; standing down without action.")
             return
         else:
+            state["last_balance"] = snap_before["balance"]
             log("Account flat and no bot-managed prior position recorded; safe to proceed.")
 
-        state = ensure_state(state, snap_after_close, now)
-        metrics = payout_metrics(state, snap_after_close, now)
+        state = ensure_state(state, snap_after_close, now_utc())
+        metrics = payout_metrics(state, snap_after_close, now_utc())
         lot_size, lot_reason = choose_lot_size(metrics, state)
 
         summary = [
@@ -540,16 +646,17 @@ def run():
         log("Account agent | " + " | ".join(summary) + f" | reason={lot_reason}")
 
         if lot_size <= 0.0:
+            state["last_balance"] = snap_after_close["balance"]
             save_state(state)
             browser.close()
             message = "Aqua 4H: no new trade\n" + "\n".join(summary) + "\nReason: " + lot_reason
             telegram(message)
             return
 
-        target_local = current_target_local()
+        wait_until_utc(open_at, "new candle entry window")
         sig = signal_core.build_signal(target_local)
         if not state.get("first_trade_time"):
-            state["first_trade_time"] = now.isoformat()
+            state["first_trade_time"] = now_utc().isoformat()
 
         place_signal_order(page, sig, lot_size)
         page.wait_for_timeout(1500)
@@ -560,7 +667,8 @@ def run():
         state["managed_ticket"] = new_ticket
         state["managed_target_local"] = sig["target_local"]
         snap_after_open = account_snapshot(page)
-        state = ensure_state(state, snap_after_open, now)
+        state = ensure_state(state, snap_after_open, now_utc())
+        state["last_balance"] = snap_after_open["balance"]
         save_state(state)
         browser.close()
 
