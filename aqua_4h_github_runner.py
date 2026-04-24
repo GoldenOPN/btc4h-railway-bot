@@ -356,6 +356,24 @@ def close_managed_position(page, managed_ticket: str):
     return [close_text]
 
 
+def select_btcusd(page):
+    search = page.get_by_placeholder("Search symbol")
+    if search.count() > 0 and search.first.is_visible():
+        search.first.fill("BTCUSD")
+        page.wait_for_timeout(500)
+
+    row = page.get_by_role("row", name=re.compile(r"\bBTCUSD\b"))
+    if row.count() > 0:
+        row.first.click()
+        page.wait_for_timeout(500)
+        row.first.dblclick()
+        page.wait_for_timeout(1000)
+        return
+
+    page.get_by_text("BTCUSD").first.click()
+    page.wait_for_timeout(1000)
+
+
 def open_order_ticket(page):
     create_btn = page.get_by_role("button", name="Create New Order")
     if create_btn.count() > 0 and create_btn.first.is_visible():
@@ -394,8 +412,19 @@ def order_ticket_inputs(page) -> list[dict]:
 def fill_visible_input(page, visible_index: int, value: str):
     field = page.locator("input:visible").nth(visible_index)
     field.click()
-    field.fill(value)
-    page.wait_for_timeout(250)
+    page.keyboard.press("Control+A")
+    page.keyboard.press("Backspace")
+    page.keyboard.type(value, delay=20)
+    field.evaluate(
+        """
+        el => {
+            el.dispatchEvent(new Event("input", {bubbles: true}));
+            el.dispatchEvent(new Event("change", {bubbles: true}));
+            el.blur();
+        }
+        """
+    )
+    page.wait_for_timeout(500)
 
 
 def fill_order(page, sig: dict, volume: float):
@@ -416,16 +445,6 @@ def fill_order(page, sig: dict, volume: float):
     fill_visible_input(page, int(ticket_inputs[1]["index"]), f"{sig['sl']:.2f}")
     fill_visible_input(page, int(ticket_inputs[2]["index"]), f"{sig['tp']:.2f}")
 
-    if len(ticket_inputs) >= 4:
-        try:
-            fill_visible_input(
-                page,
-                int(ticket_inputs[3]["index"]),
-                f"4h {sig['target_local']} {sig['bias']}",
-            )
-        except Exception:
-            pass
-
     log(
         "Order ticket filled | "
         f"bias={sig['bias']} | volume={volume:.2f} | "
@@ -435,6 +454,7 @@ def fill_order(page, sig: dict, volume: float):
 
 
 def place_signal_order(page, sig: dict, volume: float):
+    select_btcusd(page)
     open_order_ticket(page)
     fill_order(page, sig, volume)
     button_name = "Buy by Market" if sig["bias"] == "Buy" else "Sell by Market"
