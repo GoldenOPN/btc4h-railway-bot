@@ -1,4 +1,14 @@
 {
   "closed_trades": [],
-  "daily_realized": {}
+  "cycle_start_balance": 101752.22,
+  "cycle_start_time": "2026-04-24T00:25:24.605915+00:00",
+  "daily_anchor_balance": 101752.22,
+  "daily_anchor_day": "2026-04-24",
+  "daily_realized": {},
+  "first_trade_time": "2026-04-24T00:25:24.605915+00:00",
+  "highest_balance": 103000.0,
+  "initial_balance": 100000.0,
+  "managed_open": true,
+  "managed_target_local": "2026-04-24 01:00:00",
+  "managed_ticket": "22745611"
 }
